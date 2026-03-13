@@ -1,4 +1,8 @@
-"""client.py ── Pygame client for Mini Multiplayer Bullet Game"""
+"""client.py  --  Pygame client for Mini Multiplayer Bullet Game
+
+Rendering for pickups uses coloured shapes + single-char labels so they
+display correctly on every system (no emoji-font dependency).
+"""
 import argparse, asyncio, json, math, time, random, pygame, websockets
 
 WIDTH, HEIGHT = 800, 600
@@ -8,10 +12,11 @@ SEND_HZ  = 20
 BOUNDARY = 50
 MSG_TTL  = 5.0
 
-# hit feedback
-SHAKE_DURATION = 0.25
-SHAKE_INTENSITY = 8
-RED_FLASH_DURATION = 0.3
+# hit-feedback timers
+SHAKE_DURATION     = 0.25
+SHAKE_INTENSITY    = 8
+RED_FLASH_DURATION = 0.35
+BLUE_FLASH_DURATION = 0.30
 
 COL = {
     "bg":       (20, 20, 30),
@@ -25,9 +30,18 @@ COL = {
     "bul_p":    (255, 255, 100),
     "bul_e":    (255, 100, 100),
     "obs":      (70, 70, 90),
-    "pickup":   (255, 80, 120),
     "txt":      (200, 200, 200),
     "dim":      (140, 140, 140),
+}
+
+# =====================================================================
+# ── Pickup visual definitions (mirrors server PICKUP_DEFS) ──────
+#   shape + colours so every pickup is clearly distinct on screen
+# =====================================================================
+PICKUP_VIS = {
+    "health": {"bg": (255, 80, 120),  "border": (200, 40, 80),  "label": "+"},
+    "boost":  {"bg": (255, 220,  50), "border": (200, 170, 10), "label": "B"},
+    "shield": {"bg": (100, 180, 255), "border": (40, 120, 220), "label": "S"},
 }
 
 # ── Network ──────────────────────────────────────────────────────
@@ -65,7 +79,9 @@ async def net_task(uri, name, room, out_q, state):
                             inc[p["id"]] = {
                                 "x": float(p["x"]), "y": float(p["y"]),
                                 "name": p.get("name", ""),
-                                "hp": p.get("hp", 2), "score": p.get("score", 0),
+                                "hp": p.get("hp", 2),
+                                "max_hp": p.get("max_hp", 4),
+                                "score": p.get("score", 0),
                                 "fdx": p.get("fdx", 1), "fdy": p.get("fdy", 0),
                                 "dead": p.get("dead", False),
                                 "immortal": p.get("immortal", False),
@@ -75,13 +91,9 @@ async def net_task(uri, name, room, out_q, state):
                         for pid, pd in inc.items():
                             if pid == my:
                                 me = state["peers"].setdefault(my, {})
-                                me["name"]  = pd["name"]
-                                me["hp"]    = pd["hp"]
-                                me["score"] = pd["score"]
-                                me["dead"]  = pd["dead"]
-                                me["immortal"] = pd["immortal"]
-                                me["shield"] = pd["shield"]
-                                me["boost"]  = pd["boost"]
+                                for k in ("name", "hp", "max_hp", "score",
+                                          "dead", "immortal", "shield", "boost"):
+                                    me[k] = pd[k]
                                 me["x"] = me.get("x", 0.0) * 0.75 + pd["x"] * 0.25
                                 me["y"] = me.get("y", 0.0) * 0.75 + pd["y"] * 0.25
                             else:
@@ -89,10 +101,10 @@ async def net_task(uri, name, room, out_q, state):
                         for pid in list(state["peers"]):
                             if pid not in inc and pid != "local":
                                 state["peers"].pop(pid)
-                        state["enemies"]   = d.get("enemies", [])
-                        state["bullets"]   = d.get("bullets", [])
-                        state["obstacles"] = d.get("obstacles", [])
-                        state["pickups"]   = d.get("pickups", [])
+                        state["enemies"]      = d.get("enemies", [])
+                        state["bullets"]      = d.get("bullets", [])
+                        state["obstacles"]    = d.get("obstacles", [])
+                        state["pickups"]      = d.get("pickups", [])
                         state["level"]        = d.get("level", 1)
                         state["kills"]        = d.get("kills", 0)
                         state["kills_needed"] = d.get("kills_needed", 6)
@@ -102,13 +114,20 @@ async def net_task(uri, name, room, out_q, state):
                         state["room"] = d.get("room")
 
                     elif t == "hit":
+                        absorbed = d.get("absorbed", False)
                         state["shake_t"] = SHAKE_DURATION
-                        state["flash_t"] = RED_FLASH_DURATION
+                        if absorbed:
+                            state["blue_flash_t"] = BLUE_FLASH_DURATION
+                        else:
+                            state["red_flash_t"] = RED_FLASH_DURATION
 
                     elif t == "player_join":
                         pid = d.get("id"); pn = d.get("name", "")
-                        state["peers"].setdefault(pid, {"x": 0, "y": 0, "name": pn,
-                                                        "hp": 2, "score": 0, "dead": False})
+                        state["peers"].setdefault(pid, {
+                            "x": 0, "y": 0, "name": pn,
+                            "hp": 2, "max_hp": 4, "score": 0,
+                            "dead": False, "immortal": False,
+                            "shield": False, "boost": False})
                         _msg(state, f"+ {pn} joined")
 
                     elif t == "player_leave":
@@ -125,12 +144,17 @@ async def net_task(uri, name, room, out_q, state):
 def _msg(st, text):
     st["msgs"].append((text, time.time()))
 
-# ── Drawing ──────────────────────────────────────────────────────
+# ── Drawing helpers ──────────────────────────────────────────────
 def _w2s(wx, wy, cx, cy):
     return int(WIDTH / 2 + (wx - cx) * TILE), int(HEIGHT / 2 + (wy - cy) * TILE)
 
 
-def draw(screen, state, font, fsm, emoji_font):
+def _draw_diamond(surface, colour, cx, cy, r):
+    pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
+    pygame.draw.polygon(surface, colour, pts)
+
+# ── Main draw ────────────────────────────────────────────────────
+def draw(screen, state, font, fsm):
     me = state["peers"].get(state["my_id"], {"x": 0, "y": 0})
     cx, cy = me.get("x", 0), me.get("y", 0)
 
@@ -166,24 +190,29 @@ def draw(screen, state, font, fsm, emoji_font):
         pygame.draw.rect(screen, COL["obs"],
                          (ox + sx_off, oy + sy_off, int(o["w"] * TILE), int(o["h"] * TILE)))
 
-    # pickups (emoji: health=heart, boost=lightning, shield=snowflake)
+    # ── pickups (shaped icons, no emoji font needed) ─────────────
     for pk in state.get("pickups", []):
         px, py = _w2s(pk["x"], pk["y"], cx, cy)
         px += sx_off; py += sy_off
         tp = pk.get("tp", "health")
+        vis = PICKUP_VIS.get(tp, PICKUP_VIS["health"])
         if tp == "boost":
-            # yellow lightning bolt
-            lbl = emoji_font.render("\u26A1", True, (255, 220, 50))
-            screen.blit(lbl, (px - lbl.get_width() // 2, py - lbl.get_height() // 2))
+            _draw_diamond(screen, vis["bg"], px, py, 10)
+            _draw_diamond(screen, vis["border"], px, py, 10)
+            pygame.draw.lines(screen, (255, 255, 255), False,
+                              [(px - 2, py - 7), (px + 2, py - 1),
+                               (px - 2, py + 1), (px + 2, py + 7)], 2)
         elif tp == "shield":
-            # blue snowflake
-            lbl = emoji_font.render("\u2744", True, (100, 180, 255))
-            screen.blit(lbl, (px - lbl.get_width() // 2, py - lbl.get_height() // 2))
+            pygame.draw.circle(screen, vis["bg"], (px, py), 10)
+            pygame.draw.circle(screen, vis["border"], (px, py), 10, 2)
+            pygame.draw.circle(screen, (255, 255, 255), (px, py), 5, 1)
         else:
-            # pink heart for health
-            pygame.draw.circle(screen, COL["pickup"], (px, py), 6)
-            lbl = emoji_font.render("\u2764", True, (255, 80, 120))
-            screen.blit(lbl, (px - lbl.get_width() // 2, py - lbl.get_height() // 2))
+            pygame.draw.circle(screen, vis["bg"], (px, py), 9)
+            pygame.draw.circle(screen, vis["border"], (px, py), 9, 2)
+            pygame.draw.line(screen, (255, 255, 255), (px - 4, py), (px + 4, py), 2)
+            pygame.draw.line(screen, (255, 255, 255), (px, py - 4), (px, py + 4), 2)
+        lbl = fsm.render(vis["label"], True, (255, 255, 255))
+        screen.blit(lbl, (px - lbl.get_width() // 2, py + 11))
 
     # enemies
     for e in state.get("enemies", []):
@@ -210,32 +239,24 @@ def draw(screen, state, font, fsm, emoji_font):
         sx, sy = _w2s(p["x"], p["y"], cx, cy)
         sx += sx_off; sy += sy_off
 
-        # skip drawing if dead
         if p.get("dead"):
-            # just show a little X
             pygame.draw.line(screen, COL["dead"], (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
             pygame.draw.line(screen, COL["dead"], (sx + 6, sy - 6), (sx - 6, sy + 6), 2)
             continue
 
-        # immortal blinking: visible for 0.15s, invisible for 0.15s
+        # immortal blink (~6.67 Hz)
         is_immortal = p.get("immortal", False)
         if is_immortal and int(now_t * 6.67) % 2 == 0:
-            # blink off — skip drawing the player body, still show name
             lbl = fsm.render(p.get("name", "") or pid, True, (220, 220, 220))
             screen.blit(lbl, (sx - lbl.get_width() // 2, sy - 28))
             continue
 
-        # determine color
-        if pid == state["my_id"]:
-            col = COL["self"]
-        else:
-            col = COL["other"]
+        col = COL["self"] if pid == state["my_id"] else COL["other"]
 
-        # shield glow ring
+        # shield ring
         if p.get("shield"):
             pygame.draw.circle(screen, (100, 180, 255), (sx, sy), 18, 2)
-
-        # boost glow ring
+        # boost ring
         if p.get("boost"):
             pygame.draw.circle(screen, (255, 220, 50), (sx, sy), 16, 2)
 
@@ -246,37 +267,44 @@ def draw(screen, state, font, fsm, emoji_font):
         pygame.draw.line(screen, (255, 255, 255), (sx, sy),
                          (sx + int(fdx * 14), sy + int(fdy * 14)), 2)
 
-        # name label
+        # name
         lbl = fsm.render(p.get("name", "") or pid, True, (220, 220, 220))
         screen.blit(lbl, (sx - lbl.get_width() // 2, sy - 28))
 
-    # ── HUD (not affected by shake) ──
+    # ══════════════════════════════════════════════════════════════
+    #  HUD (not affected by shake)
+    # ══════════════════════════════════════════════════════════════
 
-    # top-center: coords + level + kills
+    # top-center: level + kills + coords
     level = state.get("level", 1)
     kills = state.get("kills", 0)
     kn    = state.get("kills_needed", 6)
-    coord = font.render(f"Lv.{level}  Kills: {kills}/{kn}  pos: ({cx:.1f}, {cy:.1f})", True, COL["txt"])
+    coord = font.render(
+        f"Lv.{level}  Kills: {kills}/{kn}  pos: ({cx:.1f}, {cy:.1f})",
+        True, COL["txt"])
     screen.blit(coord, (WIDTH // 2 - coord.get_width() // 2, 8))
 
-    # top-left: player count + HP + buffs
+    # top-left: player count + HP (up to 4 hearts) + buffs
     pc = fsm.render(f"Players: {len(state['peers'])}", True, COL["dim"])
     screen.blit(pc, (10, 10))
-    hp = max(me.get("hp", 2), 0)
-    mx = 2
-    hp_str = "HP: " + ("\u2764 " * hp) + ("\u2581 " * (mx - hp))
+
+    hp     = max(me.get("hp", 2), 0)
+    max_hp = me.get("max_hp", 4)
+    hearts = min(hp, max_hp)
+    empty  = max_hp - hearts
+    hp_str = "HP: " + ("@ " * hearts) + ("_ " * empty)
     ht = fsm.render(hp_str, True, (255, 100, 100))
     screen.blit(ht, (10, 30))
-    # buffs
+
     buf_y = 50
     if me.get("shield"):
-        screen.blit(fsm.render("\u2744 Shield active", True, (100, 180, 255)), (10, buf_y))
+        screen.blit(fsm.render("[S] Shield active", True, (100, 180, 255)), (10, buf_y))
         buf_y += 18
     if me.get("boost"):
-        screen.blit(fsm.render("\u26A1 Boost active", True, (255, 220, 50)), (10, buf_y))
+        screen.blit(fsm.render("[B] Boost active", True, (255, 220, 50)), (10, buf_y))
         buf_y += 18
     if me.get("immortal"):
-        screen.blit(fsm.render("* IMMORTAL *", True, (255, 255, 200)), (10, buf_y))
+        screen.blit(fsm.render("** IMMORTAL **", True, (255, 255, 200)), (10, buf_y))
         buf_y += 18
 
     # top-right: score ranking
@@ -310,7 +338,7 @@ def draw(screen, state, font, fsm, emoji_font):
         sub = fsm.render("Next level loading...", True, (180, 255, 180))
         screen.blit(sub, (WIDTH // 2 - sub.get_width() // 2, HEIGHT // 2))
 
-    # dead overlay — manual respawn
+    # dead overlay -- manual respawn
     if me.get("dead"):
         ov = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         ov.fill((0, 0, 0, 150))
@@ -322,18 +350,42 @@ def draw(screen, state, font, fsm, emoji_font):
         r2 = fsm.render("[ T ]  Respawn at current position", True, (180, 180, 220))
         screen.blit(r2, (WIDTH // 2 - r2.get_width() // 2, HEIGHT // 2 + 35))
 
-    # red flash overlay when hit
-    if state.get("flash_t", 0) > 0:
-        alpha = int(100 * (state["flash_t"] / RED_FLASH_DURATION))
+    # ── red flash overlay (damage taken) ─────────────────────────
+    if state.get("red_flash_t", 0) > 0:
+        ratio = state["red_flash_t"] / RED_FLASH_DURATION
+        alpha = int(100 * ratio)
         flash = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         flash.fill((255, 0, 0, alpha))
-        screen.blit(flash, (0, 0))
-        # red border
         bw = 6
-        pygame.draw.rect(screen, (255, 30, 30, alpha), (0, 0, WIDTH, bw))
-        pygame.draw.rect(screen, (255, 30, 30, alpha), (0, HEIGHT - bw, WIDTH, bw))
-        pygame.draw.rect(screen, (255, 30, 30, alpha), (0, 0, bw, HEIGHT))
-        pygame.draw.rect(screen, (255, 30, 30, alpha), (WIDTH - bw, 0, bw, HEIGHT))
+        pygame.draw.rect(flash, (255, 30, 30, min(255, alpha + 80)),
+                         (0, 0, WIDTH, bw))
+        pygame.draw.rect(flash, (255, 30, 30, min(255, alpha + 80)),
+                         (0, HEIGHT - bw, WIDTH, bw))
+        pygame.draw.rect(flash, (255, 30, 30, min(255, alpha + 80)),
+                         (0, 0, bw, HEIGHT))
+        pygame.draw.rect(flash, (255, 30, 30, min(255, alpha + 80)),
+                         (WIDTH - bw, 0, bw, HEIGHT))
+        screen.blit(flash, (0, 0))
+
+    # ── blue flash overlay (shield absorbed) ─────────────────────
+    if state.get("blue_flash_t", 0) > 0:
+        ratio = state["blue_flash_t"] / BLUE_FLASH_DURATION
+        alpha = int(80 * ratio)
+        flash = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        flash.fill((60, 120, 255, alpha))
+        bw = 5
+        pygame.draw.rect(flash, (60, 120, 255, min(255, alpha + 100)),
+                         (0, 0, WIDTH, bw))
+        pygame.draw.rect(flash, (60, 120, 255, min(255, alpha + 100)),
+                         (0, HEIGHT - bw, WIDTH, bw))
+        pygame.draw.rect(flash, (60, 120, 255, min(255, alpha + 100)),
+                         (0, 0, bw, HEIGHT))
+        pygame.draw.rect(flash, (60, 120, 255, min(255, alpha + 100)),
+                         (WIDTH - bw, 0, bw, HEIGHT))
+        screen.blit(flash, (0, 0))
+        # "SHIELD BREAK" text
+        sb = fsm.render("SHIELD BREAK!", True, (100, 180, 255))
+        screen.blit(sb, (WIDTH // 2 - sb.get_width() // 2, HEIGHT // 2 + 60))
 
     # error
     if state.get("error"):
@@ -368,7 +420,7 @@ async def run_menu(screen, font):
 
 
 # ── Game loop ────────────────────────────────────────────────────
-async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
+async def run_game(screen, font, fsm, state, out_q, mp):
     send_iv  = 1.0 / SEND_HZ
     send_acc = 0.0
     shoot_cd = 0.0
@@ -383,11 +435,10 @@ async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
         prev = now
         shoot_cd = max(0, shoot_cd - dt)
 
-        # tick down screen-shake / flash timers
-        if state.get("shake_t", 0) > 0:
-            state["shake_t"] = max(0, state["shake_t"] - dt)
-        if state.get("flash_t", 0) > 0:
-            state["flash_t"] = max(0, state["flash_t"] - dt)
+        # tick effect timers
+        for key in ("shake_t", "red_flash_t", "blue_flash_t"):
+            if state.get(key, 0) > 0:
+                state[key] = max(0, state[key] - dt)
 
         # events
         for ev in pygame.event.get():
@@ -396,7 +447,6 @@ async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     return
-                # respawn keys (only when dead)
                 my_id = state["my_id"]
                 me = state["peers"].get(my_id) or state["peers"].get("local")
                 if me and me.get("dead"):
@@ -411,13 +461,13 @@ async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
                         except asyncio.QueueFull:
                             pass
 
-        my_id = state["my_id"]
-        me = state["peers"].get(my_id) or state["peers"].get("local")
-        dead = me.get("dead", False) if me else False
+        my_id   = state["my_id"]
+        me      = state["peers"].get(my_id) or state["peers"].get("local")
+        dead    = me.get("dead", False) if me else False
         immortal = me.get("immortal", False) if me else False
         boosted = me.get("boost", False) if me else False
 
-        # movement (allowed while immortal, just can't shoot)
+        # movement
         dx = dy = 0.0
         if not dead and me:
             keys = pygame.key.get_pressed()
@@ -437,7 +487,7 @@ async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
             me["fdx"] = face[0]
             me["fdy"] = face[1]
 
-            # shoot (hold Space) — blocked during immortality
+            # shoot -- blocked during immortality
             if keys[pygame.K_SPACE] and mp and shoot_cd <= 0 and not immortal:
                 shoot_cd = 0.15
                 try:
@@ -460,7 +510,7 @@ async def run_game(screen, font, fsm, emoji_font, state, out_q, mp):
                 except asyncio.QueueFull:
                     pass
 
-        draw(screen, state, font, fsm, emoji_font)
+        draw(screen, state, font, fsm)
         pygame.display.flip()
 
         elapsed = time.perf_counter() - now
@@ -482,21 +532,19 @@ async def main():
     pygame.display.set_caption(f"[Room: {args.room}] {args.name}")
     font = pygame.font.SysFont(None, 24)
     fsm  = pygame.font.SysFont(None, 20)
-    # emoji-capable font (Segoe UI Emoji on Windows, fallback to default)
-    try:
-        emoji_font = pygame.font.SysFont("Segoe UI Emoji", 22)
-    except Exception:
-        emoji_font = pygame.font.SysFont(None, 22)
 
     state = {
-        "peers": {"local": {"x": 0.0, "y": 0.0, "name": args.name,
-                             "hp": 2, "score": 0, "fdx": 1, "fdy": 0,
-                             "dead": False, "immortal": False,
-                             "shield": False, "boost": False}},
+        "peers": {"local": {
+            "x": 0.0, "y": 0.0, "name": args.name,
+            "hp": 2, "max_hp": 4, "score": 0,
+            "fdx": 1, "fdy": 0,
+            "dead": False, "immortal": True,   # starts immortal
+            "shield": False, "boost": False,
+        }},
         "my_id": "local", "room": None, "msgs": [], "error": None,
         "enemies": [], "bullets": [], "obstacles": [], "pickups": [],
         "level": 1, "kills": 0, "kills_needed": 6, "level_clear": False,
-        "shake_t": 0.0, "flash_t": 0.0,
+        "shake_t": 0.0, "red_flash_t": 0.0, "blue_flash_t": 0.0,
     }
     out_q = asyncio.Queue(maxsize=64)
 
@@ -521,7 +569,7 @@ async def main():
             net_task(f"ws://localhost:{srv.EMBEDDED_PORT}", args.name, "solo", out_q, state))
         mp = True
 
-    await run_game(screen, font, fsm, emoji_font, state, out_q, mp)
+    await run_game(screen, font, fsm, state, out_q, mp)
 
     if net:
         net.cancel()

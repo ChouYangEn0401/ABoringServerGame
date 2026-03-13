@@ -1,4 +1,12 @@
-"""server.py ── Authoritative game server for Mini Multiplayer Bullet Game"""
+"""server.py  --  Authoritative game server for Mini Multiplayer Bullet Game
+
+Architecture notes
+-------------------
+*  Buff System   -- BUFF_DEFS   registry.  Add a key to get a new buff.
+*  Pickup System -- PICKUP_DEFS registry.  Add a key + apply_pickup branch.
+*  Weapon System -- WEAPON_DEFS registry.  fire_weapon() reads from it.
+Each registry is a plain dict so new entries need zero boilerplate.
+"""
 import asyncio, json, math, os, random, time, websockets
 
 # ── Config ───────────────────────────────────────────────────────
@@ -8,13 +16,12 @@ EMBEDDED_PORT   = 18765
 TICK            = 0.05           # 20 TPS
 BOUNDARY        = 50
 
-PLAYER_MAX_HP   = 2
-PLAYER_SHOOT_CD = 0.15
-BULLET_SPEED    = 15.0
-BULLET_R        = 0.5
+PLAYER_INIT_HP  = 2
+PLAYER_MAX_HP   = 4              # hearts can stack up to 4
 PLAYER_R        = 0.6
+BULLET_R        = 0.5
+BULLET_SPEED    = 15.0
 
-# increased hitbox radii so bullets actually register hits
 ENEMY_R         = {"small": 1.1, "big": 1.75}
 ENEMY_SPD       = {"small": 1.5, "big": 0.8}
 ENEMY_SH_CD     = {"small": 2.5, "big": 1.8}
@@ -22,23 +29,108 @@ ENEMY_BUL_SPD   = 8.0
 SCORE_KILL      = {"small": 10,  "big": 50}
 MAX_ENEMIES     = 10
 
-# staggered spawning
-SPAWN_INTERVAL  = 3.0            # seconds between periodic edge spawns
-SPAWN_QUEUE_CD  = 1.5            # delay between queued spawns
+SPAWN_INTERVAL  = 3.0
+SPAWN_QUEUE_CD  = 1.5
 
-PICKUP_SPAWN_CD = 8.0
-MAX_PICKUPS     = 6
+PICKUP_SPAWN_CD = 5.0
+MAX_PICKUPS     = 8
 
-# spawn immortality
 IMMORTAL_T      = 3.0
-
-# level system: kills_needed per level, then loop last
 LEVEL_KILLS     = [6, 10, 15, 20, 25]
 
-# buff durations
-BOOST_DURATION  = 6.0
-SHIELD_DURATION = 8.0
-BOOST_MULT      = 1.8
+# =====================================================================
+# ── Buff System (registry) ──────────────────────────────────────
+#   To add a new buff:  1) add key here  2) check with has_buff()
+# =====================================================================
+BUFF_DEFS = {
+    "immortal": {"duration": 3.0},
+    "boost":    {"duration": 20.0},
+    "shield":   {"duration": 999.0},     # stays until consumed by a hit
+}
+
+def apply_buff(p, name):
+    """Grant buff *name* to player dict *p*."""
+    p[f"{name}_t"] = BUFF_DEFS[name]["duration"]
+
+def has_buff(p, name):
+    return p.get(f"{name}_t", 0) > 0
+
+def tick_buffs(p, dt):
+    for name in BUFF_DEFS:
+        key = f"{name}_t"
+        if p.get(key, 0) > 0:
+            p[key] = max(0, p[key] - dt)
+
+def init_buff_fields(p):
+    """Zero every buff timer (call once on player creation)."""
+    for name in BUFF_DEFS:
+        p[f"{name}_t"] = 0
+
+# =====================================================================
+# ── Pickup System (registry) ───────────────────────────────────
+#   To add a new pickup:  1) add key+weight here  2) add branch in
+#   apply_pickup()
+# =====================================================================
+PICKUP_DEFS = {
+    "health":  {"weight": 50},
+    "boost":   {"weight": 25},
+    "shield":  {"weight": 25},
+}
+
+def random_pickup_type():
+    types   = list(PICKUP_DEFS.keys())
+    weights = [PICKUP_DEFS[t]["weight"] for t in types]
+    return random.choices(types, weights=weights, k=1)[0]
+
+def apply_pickup(p, ptype):
+    """Apply pickup effect to player *p*.  Returns True if consumed."""
+    if ptype == "health":
+        if p.get("hp", PLAYER_INIT_HP) < PLAYER_MAX_HP:
+            p["hp"] = min(PLAYER_MAX_HP, p["hp"] + 1)
+            return True
+        return False                    # already full
+    if ptype in BUFF_DEFS:
+        apply_buff(p, ptype)
+        return True
+    return False
+
+# =====================================================================
+# ── Weapon System (registry) ───────────────────────────────────
+#   To add a new weapon:  add key here, then call fire_weapon(w=key)
+# =====================================================================
+WEAPON_DEFS = {
+    "default": {"speed": BULLET_SPEED, "cooldown": 0.15,
+                "damage": 1, "count": 1, "spread": 0.0},
+}
+
+def fire_weapon(g, p, pid, fdx, fdy, weapon="default"):
+    """Spawn bullet(s) for player *pid* using weapon def."""
+    w = WEAPON_DEFS[weapon]
+    p["scd"] = w["cooldown"]
+    base = math.atan2(fdy, fdx)
+    for i in range(w["count"]):
+        off = (i - (w["count"] - 1) / 2) * w["spread"]
+        a = base + off
+        g["bullets"].append({
+            "id": g["_bid"], "x": p["x"], "y": p["y"],
+            "vx": math.cos(a) * w["speed"],
+            "vy": math.sin(a) * w["speed"],
+            "owner": "player", "opid": pid, "dmg": w["damage"],
+        })
+        g["_bid"] += 1
+
+# ── Helpers ──────────────────────────────────────────────────────
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def dist(a, b, c, d): return math.hypot(a - c, b - d)
+def pt_in_rect(px, py, rx, ry, rw, rh):
+    return rx <= px <= rx + rw and ry <= py <= ry + rh
+
+def _random_spawn_pos():
+    """Well-spread spawn position, avoids center 10-unit radius."""
+    qx = random.choice([-1, 1])
+    qy = random.choice([-1, 1])
+    return (round(qx * random.uniform(12, BOUNDARY - 5), 1),
+            round(qy * random.uniform(12, BOUNDARY - 5), 1))
 
 # ── Global state ─────────────────────────────────────────────────
 clients    = {}
@@ -47,12 +139,6 @@ rooms      = {}
 room_games = {}
 _nid       = 1
 _lock      = asyncio.Lock()
-
-# ── Helpers ──────────────────────────────────────────────────────
-def clamp(v, lo, hi): return max(lo, min(hi, v))
-def dist(a, b, c, d): return math.hypot(a - c, b - d)
-def pt_in_rect(px, py, rx, ry, rw, rh):
-    return rx <= px <= rx + rw and ry <= py <= ry + rh
 
 # ── Map ──────────────────────────────────────────────────────────
 def _load_map(name):
@@ -77,9 +163,12 @@ def _rand_map():
         if abs(ex) < 10 and abs(ey) < 10:
             continue
         es.append({"x": ex, "y": ey, "type": "big" if random.random() < .2 else "small"})
-    ps = [{"x": round(random.uniform(-40, 40), 1),
-           "y": round(random.uniform(-40, 40), 1), "type": "health"}
-          for _ in range(random.randint(2, 4))]
+    # mixed pickup types from the start
+    ps = []
+    for _ in range(random.randint(3, 5)):
+        ps.append({"x": round(random.uniform(-40, 40), 1),
+                    "y": round(random.uniform(-40, 40), 1),
+                    "type": random_pickup_type()})
     return {"obstacles": obs, "enemy_spawns": es, "pickup_spawns": ps}
 
 # ── Room game state ──────────────────────────────────────────────
@@ -96,8 +185,7 @@ def _init_room(room):
         "_spawn_cd": 0.0,
         "_spawn_timer": 0.0,
         "pickup_t": 0.0,
-        "level": 1,
-        "kills": 0,
+        "level": 1, "kills": 0,
         "kills_needed": LEVEL_KILLS[0],
         "level_clear": False,
         "_level_msg_t": 0.0,
@@ -105,7 +193,8 @@ def _init_room(room):
     for s in m.get("enemy_spawns", []):
         g["_spawn_queue"].append({"x": s["x"], "y": s["y"], "type": s["type"]})
     for s in m.get("pickup_spawns", []):
-        g["pickups"].append({"x": s["x"], "y": s["y"], "type": s.get("type", "health")})
+        g["pickups"].append({"x": s["x"], "y": s["y"],
+                              "type": s.get("type", "health")})
     room_games[room] = g
     return g
 
@@ -120,17 +209,14 @@ def _next_level(g):
     g["enemies"] = []
     m = _rand_map()
     g["obstacles"] = m.get("obstacles", [])
-    base_count = 4 + lvl * 2
-    for _ in range(base_count):
+    for _ in range(4 + lvl * 2):
         tp = "big" if random.random() < (0.1 + lvl * 0.05) else "small"
-        ex = round(random.uniform(-BOUNDARY + 5, BOUNDARY - 5), 1)
-        ey = round(random.uniform(-BOUNDARY + 5, BOUNDARY - 5), 1)
-        if abs(ex) < 10 and abs(ey) < 10:
-            ex += 15 * (1 if ex >= 0 else -1)
-        g["_spawn_queue"].append({"x": ex, "y": ey, "type": tp})
+        x, y = _random_spawn_pos()
+        g["_spawn_queue"].append({"x": x, "y": y, "type": tp})
     g["pickups"] = []
     for s in m.get("pickup_spawns", []):
-        g["pickups"].append({"x": s["x"], "y": s["y"], "type": s.get("type", "health")})
+        g["pickups"].append({"x": s["x"], "y": s["y"],
+                              "type": s.get("type", "health")})
 
 def _game(room):
     return room_games.get(room) or _init_room(room)
@@ -158,13 +244,15 @@ async def _bcast_room(room):
             continue
         pl.append({
             "id": pid, "x": round(p["x"], 2), "y": round(p["y"], 2),
-            "name": p.get("name", ""), "hp": p.get("hp", PLAYER_MAX_HP),
+            "name": p.get("name", ""),
+            "hp": p.get("hp", PLAYER_INIT_HP),
+            "max_hp": PLAYER_MAX_HP,
             "score": p.get("score", 0),
             "fdx": p.get("fdx", 1), "fdy": p.get("fdy", 0),
             "dead": p.get("dead", False),
-            "immortal": p.get("immortal_t", 0) > 0,
-            "shield": p.get("shield_t", 0) > 0,
-            "boost": p.get("boost_t", 0) > 0,
+            "immortal": has_buff(p, "immortal"),
+            "shield":   has_buff(p, "shield"),
+            "boost":    has_buff(p, "boost"),
         })
     msg = {"type": "state", "room": room, "players": pl}
     if g:
@@ -184,10 +272,10 @@ async def _bcast_room(room):
     await asyncio.gather(*[_send(clients[pid], s) for pid in pids if pid in clients],
                          return_exceptions=True)
 
-async def _send_hit(pid):
+async def _send_hit(pid, absorbed=False):
     ws = clients.get(pid)
     if ws:
-        await _send(ws, json.dumps({"type": "hit"}))
+        await _send(ws, json.dumps({"type": "hit", "absorbed": absorbed}))
 
 # ── Game tick ────────────────────────────────────────────────────
 def _tick(room, dt):
@@ -195,25 +283,18 @@ def _tick(room, dt):
     g = room_games.get(room)
     if not g:
         return []
-    hit_pids = []
+    hit_pids = []      # (pid, absorbed)
 
     alive = {pid: players[pid] for pid in pids
              if pid in players and not players[pid].get("dead")}
 
-    # tick buffs / immortality
+    # tick buffs + shoot cooldowns
     for pid in pids:
         p = players.get(pid)
         if not p:
             continue
-        for key in ("immortal_t", "boost_t", "shield_t"):
-            if p.get(key, 0) > 0:
-                p[key] = max(0, p[key] - dt)
-
-    # shoot cooldowns
-    for pid in pids:
-        p = players.get(pid)
-        if p:
-            p["scd"] = max(0, p.get("scd", 0) - dt)
+        tick_buffs(p, dt)
+        p["scd"] = max(0, p.get("scd", 0) - dt)
 
     # move bullets
     for b in g["bullets"]:
@@ -229,7 +310,24 @@ def _tick(room, dt):
                     if not any(pt_in_rect(b["x"], b["y"], o["x"], o["y"], o["w"], o["h"])
                                for o in g["obstacles"])]
 
-    # player-bullets -> enemies
+    # ── bullet <-> bullet cancellation (player vs enemy) ────────
+    p_idx = [i for i, b in enumerate(g["bullets"]) if b["owner"] == "player"]
+    e_idx = [i for i, b in enumerate(g["bullets"]) if b["owner"] == "enemy"]
+    cancel = set()
+    for pi in p_idx:
+        pb = g["bullets"][pi]
+        for ei in e_idx:
+            if ei in cancel:
+                continue
+            eb = g["bullets"][ei]
+            if dist(pb["x"], pb["y"], eb["x"], eb["y"]) < BULLET_R * 2 + 0.3:
+                cancel.add(pi)
+                cancel.add(ei)
+                break
+    if cancel:
+        g["bullets"] = [b for i, b in enumerate(g["bullets"]) if i not in cancel]
+
+    # ── player-bullets -> enemies ────────────────────────────────
     rb, re = set(), set()
     for i, b in enumerate(g["bullets"]):
         if b["owner"] != "player":
@@ -237,74 +335,66 @@ def _tick(room, dt):
         for e in g["enemies"]:
             sz = ENEMY_R.get(e["type"], 1.1)
             if dist(b["x"], b["y"], e["x"], e["y"]) < sz + BULLET_R:
-                e["hp"] -= 1
+                e["hp"] -= b.get("dmg", 1)
                 rb.add(i)
                 if e["hp"] <= 0:
                     re.add(e["id"])
                     g["kills"] = g.get("kills", 0) + 1
                     op = b.get("opid")
                     if op and op in players:
-                        players[op]["score"] = players[op].get("score", 0) + SCORE_KILL.get(e["type"], 10)
+                        players[op]["score"] += SCORE_KILL.get(e["type"], 10)
                 break
     g["bullets"] = [b for i, b in enumerate(g["bullets"]) if i not in rb]
     g["enemies"] = [e for e in g["enemies"] if e["id"] not in re]
 
-    # level clear check
+    # level clear
     if not g.get("level_clear") and g["kills"] >= g.get("kills_needed", 6):
         g["level_clear"] = True
         g["_level_msg_t"] = 3.0
-
     if g.get("level_clear"):
         g["_level_msg_t"] -= dt
         if g["_level_msg_t"] <= 0:
             _next_level(g)
 
-    # enemy-bullets -> players
+    # ── enemy-bullets -> players ─────────────────────────────────
     rb2 = set()
     for i, b in enumerate(g["bullets"]):
         if b["owner"] != "enemy":
             continue
         for pid, p in alive.items():
-            if p.get("immortal_t", 0) > 0:
+            if has_buff(p, "immortal"):
                 continue
             if dist(b["x"], b["y"], p["x"], p["y"]) < PLAYER_R + BULLET_R:
                 rb2.add(i)
-                if p.get("shield_t", 0) > 0:
-                    p["shield_t"] = 0
+                if has_buff(p, "shield"):
+                    p["shield_t"] = 0          # shield absorbs & breaks
+                    hit_pids.append((pid, True))
                 else:
-                    p["hp"] = p.get("hp", PLAYER_MAX_HP) - 1
-                    hit_pids.append(pid)
+                    p["hp"] = p.get("hp", PLAYER_INIT_HP) - 1
+                    hit_pids.append((pid, False))
                     if p["hp"] <= 0:
                         p["dead"] = True
                 break
     g["bullets"] = [b for i, b in enumerate(g["bullets"]) if i not in rb2]
 
-    # player <-> pickup
+    # ── player <-> pickup (uses apply_pickup registry) ───────────
     rp = []
     for i, pk in enumerate(g["pickups"]):
         for pid, p in alive.items():
             if dist(pk["x"], pk["y"], p["x"], p["y"]) < PLAYER_R + 0.6:
-                pt = pk.get("type", "health")
-                if pt == "health":
-                    if p.get("hp", PLAYER_MAX_HP) < PLAYER_MAX_HP:
-                        p["hp"] = min(PLAYER_MAX_HP, p["hp"] + 1)
-                        rp.append(i)
-                elif pt == "boost":
-                    p["boost_t"] = BOOST_DURATION
-                    rp.append(i)
-                elif pt == "shield":
-                    p["shield_t"] = SHIELD_DURATION
+                if apply_pickup(p, pk.get("type", "health")):
                     rp.append(i)
                 break
     for i in sorted(rp, reverse=True):
         g["pickups"].pop(i)
 
-    # enemy AI
+    # ── enemy AI ─────────────────────────────────────────────────
     for e in g["enemies"]:
         if not alive:
             e["vx"] = e["vy"] = 0
             continue
-        npid = min(alive, key=lambda pid: dist(e["x"], e["y"], alive[pid]["x"], alive[pid]["y"]))
+        npid = min(alive, key=lambda pid: dist(e["x"], e["y"],
+                                               alive[pid]["x"], alive[pid]["y"]))
         np = alive[npid]
         d = dist(e["x"], e["y"], np["x"], np["y"])
         spd = ENEMY_SPD.get(e["type"], 1.5)
@@ -335,7 +425,7 @@ def _tick(room, dt):
                                          "owner": "enemy"})
                     g["_bid"] += 1
 
-    # staggered spawns from queue (one at a time)
+    # ── staggered spawns from queue ──────────────────────────────
     if g["_spawn_queue"] and len(g["enemies"]) < MAX_ENEMIES:
         g["_spawn_cd"] -= dt
         if g["_spawn_cd"] <= 0:
@@ -347,7 +437,7 @@ def _tick(room, dt):
             g["_eid"] += 1
             g["_spawn_cd"] = SPAWN_QUEUE_CD
 
-    # periodic edge spawns (only when queue empty and level not cleared)
+    # periodic edge spawns
     if not g["_spawn_queue"] and not g.get("level_clear"):
         g["_spawn_timer"] += dt
         if g["_spawn_timer"] >= SPAWN_INTERVAL and len(g["enemies"]) < MAX_ENEMIES:
@@ -365,19 +455,13 @@ def _tick(room, dt):
                                  "vx": 0, "vy": 0, "scd": random.uniform(1, 3)})
             g["_eid"] += 1
 
-    # spawn pickups (health / boost / shield)
+    # ── spawn pickups (mixed types via registry) ─────────────────
     g["pickup_t"] += dt
     if g["pickup_t"] >= PICKUP_SPAWN_CD and len(g["pickups"]) < MAX_PICKUPS:
         g["pickup_t"] = 0
-        r = random.random()
-        if r < 0.5:
-            pt = "health"
-        elif r < 0.75:
-            pt = "boost"
-        else:
-            pt = "shield"
         g["pickups"].append({"x": round(random.uniform(-40, 40), 1),
-                             "y": round(random.uniform(-40, 40), 1), "type": pt})
+                             "y": round(random.uniform(-40, 40), 1),
+                             "type": random_pickup_type()})
 
     return hit_pids
 
@@ -387,10 +471,9 @@ async def _tick_loop():
         await asyncio.sleep(TICK)
         for room in list(rooms.keys()):
             if room in room_games:
-                hit_pids = _tick(room, TICK)
-                if hit_pids:
-                    for pid in hit_pids:
-                        await _send_hit(pid)
+                hits = _tick(room, TICK)
+                for pid, absorbed in hits:
+                    await _send_hit(pid, absorbed)
             await _bcast_room(room)
 
 # ── Handler ──────────────────────────────────────────────────────
@@ -399,10 +482,11 @@ async def handler(ws):
     async with _lock:
         pid = str(_nid); _nid += 1
         clients[pid] = ws
-        players[pid] = {"x": 0.0, "y": 0.0, "room": None, "name": "",
-                        "hp": PLAYER_MAX_HP, "score": 0,
-                        "fdx": 1, "fdy": 0, "dead": False, "scd": 0,
-                        "immortal_t": 0, "boost_t": 0, "shield_t": 0}
+        p = {"x": 0.0, "y": 0.0, "room": None, "name": "",
+             "hp": PLAYER_INIT_HP, "score": 0,
+             "fdx": 1, "fdy": 0, "dead": False, "scd": 0}
+        init_buff_fields(p)
+        players[pid] = p
     print(f"[srv] + client {pid}")
     try:
         await _send(ws, json.dumps({"type": "welcome", "id": pid}))
@@ -422,12 +506,12 @@ async def handler(ws):
                     if old and pid in rooms.get(old, set()):
                         rooms[old].discard(pid)
                     rooms.setdefault(room, set()).add(pid)
-                    players[pid].update(room=room, name=name, hp=PLAYER_MAX_HP,
-                                        score=0, dead=False,
-                                        x=random.uniform(-5, 5),
-                                        y=random.uniform(-5, 5),
-                                        immortal_t=IMMORTAL_T,
-                                        boost_t=0, shield_t=0)
+                    sx, sy = random.uniform(-5, 5), random.uniform(-5, 5)
+                    players[pid].update(room=room, name=name,
+                                         hp=PLAYER_INIT_HP, score=0, dead=False,
+                                         x=sx, y=sy)
+                    init_buff_fields(players[pid])
+                    apply_buff(players[pid], "immortal")   # spawn immunity
                 _game(room)
                 print(f"[srv] {name}({pid}) -> room '{room}'")
                 await _send(ws, json.dumps({"type": "joined", "room": room}))
@@ -453,8 +537,8 @@ async def handler(ws):
             elif t == "shoot":
                 if players[pid].get("dead"):
                     continue
-                if players[pid].get("immortal_t", 0) > 0:
-                    continue
+                if has_buff(players[pid], "immortal"):
+                    continue                                   # can't shoot while immortal
                 if players[pid].get("scd", 0) > 0:
                     continue
                 room = players[pid].get("room")
@@ -466,29 +550,22 @@ async def handler(ws):
                 ln = math.hypot(fdx, fdy)
                 if ln > 0:
                     fdx /= ln; fdy /= ln
-                    players[pid]["scd"] = PLAYER_SHOOT_CD
-                    g["bullets"].append({"id": g["_bid"],
-                                         "x": players[pid]["x"],
-                                         "y": players[pid]["y"],
-                                         "vx": fdx * BULLET_SPEED,
-                                         "vy": fdy * BULLET_SPEED,
-                                         "owner": "player", "opid": pid})
-                    g["_bid"] += 1
+                    fire_weapon(g, players[pid], pid, fdx, fdy)
 
             elif t == "respawn":
                 if not players[pid].get("dead"):
                     continue
                 mode = data.get("mode", "random")
                 if mode == "here":
-                    pass   # stay at death position
+                    pass                                       # stay at death pos
                 else:
-                    players[pid]["x"] = random.uniform(-5, 5)
-                    players[pid]["y"] = random.uniform(-5, 5)
+                    sx, sy = _random_spawn_pos()
+                    players[pid]["x"] = sx
+                    players[pid]["y"] = sy
                 players[pid]["dead"] = False
-                players[pid]["hp"] = PLAYER_MAX_HP
-                players[pid]["immortal_t"] = IMMORTAL_T
-                players[pid]["shield_t"] = 0
-                players[pid]["boost_t"] = 0
+                players[pid]["hp"] = PLAYER_INIT_HP
+                init_buff_fields(players[pid])
+                apply_buff(players[pid], "immortal")
                 print(f"[srv] {players[pid]['name']}({pid}) respawned ({mode})")
 
     finally:
