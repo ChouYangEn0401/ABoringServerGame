@@ -1,119 +1,300 @@
 import argparse
 import asyncio
 import json
+import time
 import pygame
 import websockets
 
 WIDTH, HEIGHT = 800, 600
-SCALE = 20
+TILE    = 20    # pixels per world unit
+SPEED   = 5.0   # world units / sec
+SEND_HZ = 20    # network move sends per second
 
-async def network_task(uri, name, room, send_q, state):
+# ──────────────────────────── Network ────────────────────────────
+
+async def net_task(uri, name, room, out_q, state):
     try:
         async with websockets.connect(uri) as ws:
-            # server will send welcome
-            await ws.send(json.dumps({'type':'join','room':room,'name':name}))
+            await ws.send(json.dumps({'type': 'join', 'room': room, 'name': name}))
 
-            async def sender():
+            async def _send():
                 while True:
-                    msg = await send_q.get()
+                    msg = await out_q.get()
                     try:
                         await ws.send(json.dumps(msg))
                     except Exception:
                         pass
 
-            async def receiver():
-                async for message in ws:
+            async def _recv():
+                async for raw in ws:
                     try:
-                        data = json.loads(message)
+                        d = json.loads(raw)
                     except Exception:
                         continue
-                    m = data.get('type')
-                    print('[client-net] received:', data)
-                    if m == 'welcome':
-                        sid = data.get('id')
-                        # map local placeholder to assigned id
-                        if state.get('id') == 'local' and 'local' in state['players']:
-                            state['players'][sid] = state['players'].pop('local')
-                        state['id'] = sid
-                    elif m == 'state':
-                        # update shared state (merge to keep local placeholders)
-                        new_players = {p['id']:{'x':p['x'],'y':p['y'],'name':p.get('name','')} for p in data.get('players',[])}
-                        state['players'].update(new_players)
-                    elif m == 'joined':
-                        state['room'] = data.get('room')
+                    t = d.get('type')
 
-            await asyncio.gather(sender(), receiver())
+                    if t == 'welcome':
+                        sid = d['id']
+                        # rename 'local' placeholder to server-assigned id
+                        if state['my_id'] == 'local' and 'local' in state['peers']:
+                            state['peers'][sid] = state['peers'].pop('local')
+                        state['my_id'] = sid
+                        print(f"[client] connected as id={sid}")
+
+                    elif t == 'state':
+                        my = state['my_id']
+                        incoming = {
+                            p['id']: {
+                                'x': float(p['x']),
+                                'y': float(p['y']),
+                                'name': p.get('name', ''),
+                            }
+                            for p in d.get('players', [])
+                        }
+                        # update others from server; keep local x/y for self (client prediction)
+                        for pid, pdata in incoming.items():
+                            if pid == my:
+                                if my in state['peers']:
+                                    state['peers'][my]['name'] = pdata['name']
+                                else:
+                                    state['peers'][my] = pdata
+                            else:
+                                state['peers'][pid] = pdata
+                        # remove players no longer in the room
+                        for pid in list(state['peers']):
+                            if pid not in incoming and pid != 'local':
+                                state['peers'].pop(pid)
+
+                    elif t == 'joined':
+                        state['room'] = d.get('room')
+                        print(f"[client] joined room '{state['room']}'")
+
+                    elif t == 'player_join':
+                        pid   = d.get('id')
+                        pname = d.get('name', '')
+                        state['peers'].setdefault(pid, {'x': 0.0, 'y': 0.0, 'name': pname})
+                        _push_msg(state, f"+ {pname} joined")
+                        print(f"[client] {pname} joined room")
+
+                    elif t == 'player_leave':
+                        pid  = d.get('id')
+                        who  = state['peers'].get(pid, {}).get('name', pid)
+                        state['peers'].pop(pid, None)
+                        _push_msg(state, f"- {who} left")
+                        print(f"[client] {who} left room")
+
+            await asyncio.gather(_send(), _recv())
     except Exception as e:
         state['error'] = str(e)
+        print(f"[client] network error: {e}")
+
+
+def _push_msg(state, text):
+    state['msgs'].append(text)
+    if len(state['msgs']) > 6:
+        state['msgs'].pop(0)
+
+# ──────────────────────────── Drawing ────────────────────────────
+
+def draw(screen, state, font, font_sm):
+    screen.fill((20, 20, 30))
+
+    my_id = state['my_id']
+    me    = state['peers'].get(my_id, {'x': 0.0, 'y': 0.0})
+    cam_x, cam_y = me['x'], me['y']
+
+    def to_screen(x, y):
+        return (
+            int(WIDTH  / 2 + (x - cam_x) * TILE),
+            int(HEIGHT / 2 + (y - cam_y) * TILE),
+        )
+
+    # draw all players
+    for pid, p in list(state['peers'].items()):
+        sx, sy = to_screen(p['x'], p['y'])
+        color  = (80, 160, 255) if pid == my_id else (200, 120, 120)
+        pygame.draw.rect(screen, color, pygame.Rect(sx - 10, sy - 10, 20, 20))
+        label = font_sm.render(p.get('name', '') or pid, True, (220, 220, 220))
+        screen.blit(label, (sx - label.get_width() // 2, sy - 26))
+
+    # ── coords top-centre ──
+    cx = round(me['x'], 1)
+    cy = round(me['y'], 1)
+    coord = font.render(f"pos: ({cx}, {cy})", True, (200, 200, 200))
+    screen.blit(coord, (WIDTH // 2 - coord.get_width() // 2, 8))
+
+    # ── player count top-left ──
+    pc = font_sm.render(f"Players: {len(state['peers'])}", True, (180, 180, 180))
+    screen.blit(pc, (10, 10))
+
+    # ── join/leave messages ──
+    for i, m in enumerate(state.get('msgs', [])):
+        im = font_sm.render(m, True, (160, 200, 160))
+        screen.blit(im, (10, 36 + i * 18))
+
+    # ── network error ──
+    if state.get('error'):
+        err = font_sm.render('NET ERR: ' + state['error'], True, (255, 80, 80))
+        screen.blit(err, (10, HEIGHT - 30))
+
+# ──────────────────────────── Menu ───────────────────────────────
+
+async def run_menu(screen, font):
+    """Non-blocking async menu. Uses await asyncio.sleep so network can start."""
+    while True:
+        await asyncio.sleep(0)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return None
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_1:
+                    return '1'
+                if ev.key == pygame.K_2:
+                    return '2'
+
+        screen.fill((18, 18, 24))
+        t  = font.render('Mini Multiplayer Game',            True, (220, 220, 220))
+        o1 = font.render('[ 1 ]  Single Player',             True, (180, 220, 180))
+        o2 = font.render('[ 2 ]  Multiplayer  (via server)', True, (180, 180, 220))
+        h  = font.render('Press 1 or 2',                     True, (120, 120, 120))
+        screen.blit(t,  (WIDTH // 2 - t.get_width()  // 2, HEIGHT // 2 - 80))
+        screen.blit(o1, (WIDTH // 2 - o1.get_width() // 2, HEIGHT // 2 - 20))
+        screen.blit(o2, (WIDTH // 2 - o2.get_width() // 2, HEIGHT // 2 + 20))
+        screen.blit(h,  (WIDTH // 2 - h.get_width()  // 2, HEIGHT // 2 + 80))
+        pygame.display.flip()
+        await asyncio.sleep(1 / 30)
+
+# ──────────────────────────── Game loop ──────────────────────────
+
+async def run_game(screen, font, font_sm, state, out_q, multiplayer):
+    """
+    Main game loop that yields to asyncio every frame.
+    KEY FIX: await asyncio.sleep(0) at top of each frame lets the network
+    coroutine run, so messages are processed without blocking.
+    """
+    send_interval = 1.0 / SEND_HZ
+    send_acc      = 0.0
+    prev          = time.perf_counter()
+
+    while True:
+        # ── yield to asyncio so net_task can process messages ──
+        await asyncio.sleep(0)
+
+        now = time.perf_counter()
+        dt  = min(now - prev, 0.1)
+        prev = now
+
+        # ── handle events ──
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    return
+                if ev.key == pygame.K_SPACE and multiplayer:
+                    try:
+                        out_q.put_nowait({'type': 'shoot'})
+                    except asyncio.QueueFull:
+                        pass
+
+        # ── movement input ──
+        keys = pygame.key.get_pressed()
+        dx, dy = 0.0, 0.0
+        if keys[pygame.K_w]: dy -= 1
+        if keys[pygame.K_s]: dy += 1
+        if keys[pygame.K_a]: dx -= 1
+        if keys[pygame.K_d]: dx += 1
+        if dx and dy:                       # normalise diagonal
+            f = 1.0 / (2 ** 0.5)
+            dx *= f; dy *= f
+
+        # ── local immediate movement (client-side prediction) ──
+        my_id = state['my_id']
+        if my_id not in state['peers']:
+            my_id = 'local'
+        p = state['peers'].get(my_id)
+        if p:
+            p['x'] += dx * SPEED * dt
+            p['y'] += dy * SPEED * dt
+
+        # ── periodic move send to server ──
+        if multiplayer:
+            if dx or dy:
+                send_acc += dt
+                if send_acc >= send_interval:
+                    send_acc = 0.0
+                    try:
+                        out_q.put_nowait({
+                            'type': 'move',
+                            'dx': round(dx * SPEED * send_interval, 4),
+                            'dy': round(dy * SPEED * send_interval, 4),
+                        })
+                    except asyncio.QueueFull:
+                        pass
+            else:
+                send_acc = 0.0
+
+        # ── render ──
+        draw(screen, state, font, font_sm)
+        pygame.display.flip()
+
+        # ── FPS cap (non-blocking) ──
+        elapsed = time.perf_counter() - now
+        wait    = max(0.0, 1 / 60 - elapsed)
+        if wait:
+            await asyncio.sleep(wait)
+
+# ──────────────────────────── Entry ──────────────────────────────
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='Player')
-    parser.add_argument('--room', default='room1')
-    parser.add_argument('--host', default='localhost')
-    parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--name',        default='Player')
+    parser.add_argument('--room',        default='room1')
+    parser.add_argument('--host',        default='localhost')
+    parser.add_argument('--port',        type=int, default=8765)
+    parser.add_argument('--multiplayer', action='store_true',
+                        help='Skip menu, go straight to multiplayer')
     args = parser.parse_args()
 
-    uri = f"ws://{args.host}:{args.port}"
-
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    screen  = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption(f"[Room: {args.room}] {args.name}")
-    pygame.key.set_repeat(50,50)
-    clock = pygame.time.Clock()
+    font    = pygame.font.SysFont(None, 24)
+    font_sm = pygame.font.SysFont(None, 20)
 
-    send_q = asyncio.Queue()
-    # start with a local placeholder so something is rendered immediately
-    state = {'players': {'local': {'x': 0, 'y': 0, 'name': args.name}}, 'error': None, 'id': 'local', 'room': None}
+    state = {
+        'peers': {'local': {'x': 0.0, 'y': 0.0, 'name': args.name}},
+        'my_id': 'local',
+        'room':  None,
+        'msgs':  [],
+        'error': None,
+    }
+    out_q = asyncio.Queue(maxsize=64)
 
-    net = asyncio.create_task(network_task(uri, args.name, args.room, send_q, state))
+    # ── choose mode ──
+    choice = '2' if args.multiplayer else await run_menu(screen, font)
+    if choice is None:
+        pygame.quit()
+        return
 
-    running = True
-    font = pygame.font.SysFont(None, 20)
-    while running:
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                running = False
-            elif ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    running = False
-                else:
-                    if ev.key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d):
-                        keymap = {pygame.K_w:'w', pygame.K_a:'a', pygame.K_s:'s', pygame.K_d:'d'}
-                        try:
-                            send_q.put_nowait({'type':'move','dir':keymap[ev.key]})
-                        except asyncio.QueueFull:
-                            pass
-                    elif ev.key == pygame.K_SPACE:
-                        try:
-                            send_q.put_nowait({'type':'shoot'})
-                        except asyncio.QueueFull:
-                            pass
+    multiplayer = (choice == '2')
+    caption = (f"[Room: {args.room}] {args.name}"
+               if multiplayer else f"Single Player — {args.name}")
+    pygame.display.set_caption(caption)
 
-        screen.fill((20,20,30))
+    net = None
+    if multiplayer:
+        net = asyncio.create_task(
+            net_task(f"ws://{args.host}:{args.port}",
+                     args.name, args.room, out_q, state)
+        )
 
-        # draw players
-        for pid, p in state.get('players', {}).items():
-            x = int(WIDTH/2 + p['x']*SCALE)
-            y = int(HEIGHT/2 + p['y']*SCALE)
-            if pid == state.get('id'):
-                color = (80,160,255)
-            else:
-                color = (200,120,120)
-            pygame.draw.rect(screen, color, pygame.Rect(x-10, y-10, 20, 20))
-            # draw name
-            img = font.render(p.get('name','') or pid, True, (220,220,220))
-            screen.blit(img, (x-10, y-25))
+    await run_game(screen, font, font_sm, state, out_q, multiplayer)
 
-        if state.get('error'):
-            img = font.render('Network error: '+state['error'], True, (255,50,50))
-            screen.blit(img, (10,10))
-
-        pygame.display.flip()
-        clock.tick(60)
-
-    net.cancel()
+    if net:
+        net.cancel()
     pygame.quit()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
